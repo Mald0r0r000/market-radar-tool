@@ -56,6 +56,7 @@ def get_hyperliquid_depth():
         return None
 
 # --- MOTEUR D'AGRÉGATION ---
+# --- MOTEUR D'AGRÉGATION (CORRIGÉ) ---
 def process_cloud_heatmap(spot_price):
     bucket_size = 50 
     global_bids = {}
@@ -79,14 +80,22 @@ def process_cloud_heatmap(spot_price):
         if ob:
             report.append(f"✅ **{source}**")
             
+            # --- CORRECTION ICI : On lit entry[0] et entry[1] pour éviter l'erreur d'unpacking ---
+            
             # Agregation Bids
-            for p, q in ob['bids']:
+            for entry in ob['bids']:
+                p = float(entry[0]) # Prix
+                q = float(entry[1]) # Quantité
+                
                 if p < spot_price * 0.94: continue # Filtre -6%
                 bucket = (p // bucket_size) * bucket_size
                 global_bids[bucket] = global_bids.get(bucket, 0) + q
                 
             # Agregation Asks
-            for p, q in ob['asks']:
+            for entry in ob['asks']:
+                p = float(entry[0]) # Prix
+                q = float(entry[1]) # Quantité
+                
                 if p > spot_price * 1.06: continue # Filtre +6%
                 bucket = (p // bucket_size) * bucket_size
                 global_asks[bucket] = global_asks.get(bucket, 0) + q
@@ -98,6 +107,10 @@ def process_cloud_heatmap(spot_price):
         
     my_bar.empty()
     
+    # Si aucune donnée n'a été récupérée, on évite le crash suivant
+    if not global_bids and not global_asks:
+        return spot_price, spot_price, pd.DataFrame(), report
+
     # Création DataFrame
     df_bids = pd.DataFrame(list(global_bids.items()), columns=['Price', 'Volume'])
     df_bids['Side'] = 'Support (Achat)'
@@ -106,7 +119,7 @@ def process_cloud_heatmap(spot_price):
     df_asks = pd.DataFrame(list(global_asks.items()), columns=['Price', 'Volume'])
     df_asks['Side'] = 'Résistance (Vente)'
     
-    # Max Walls
+    # Max Walls (Sécurité si dict vide)
     bid_wall = max(global_bids, key=global_bids.get) if global_bids else spot_price
     ask_wall = max(global_asks, key=global_asks.get) if global_asks else spot_price
     
