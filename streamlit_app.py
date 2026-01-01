@@ -1,184 +1,155 @@
 import streamlit as st
+import ccxt
 import requests
 import pandas as pd
 import altair as alt
 
-# --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(
-    page_title="Market Radar 📡",
-    page_icon="📡",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Cloud Heatmap ☁️", page_icon="☁️", layout="centered")
 
-# --- CSS PERSONNALISÉ ---
 st.markdown("""
 <style>
     .stApp {background-color: #0E1117;}
     div.stButton > button {
-        width: 100%; 
-        background-color: #F0B90B; 
-        color: black; 
-        border: none; 
-        height: 3em; 
-        font-weight: bold; 
-        border-radius: 8px;
+        width: 100%; background-color: #7C4DFF; color: white; border: none; height: 3em; font-weight: bold; border-radius: 8px;
     }
-    div.stButton > button:hover {background-color: #D4A30A;}
-    [data-testid="stMetricValue"] { font-size: 1.4rem; }
+    div.stButton > button:hover {background-color: #651FFF;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- MOTEUR DE DONNÉES (HYBRIDE BINANCE / KRAKEN) ---
-
-def get_crypto_data():
-    """
-    Tente de récupérer les données sur Binance.
-    En cas de blocage (IP US Streamlit), bascule automatiquement sur Kraken.
-    """
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    
-    # 1. TENTATIVE BINANCE (Priorité 1)
+# --- 1. FETCHERS CEX (Kraken & Coinbase) ---
+def get_cex_depth(exchange_name, symbol='BTC/USDT'):
     try:
-        # Prix
-        url_price = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        resp_price = requests.get(url_price, headers=headers, timeout=2)
-        resp_price.raise_for_status() # Vérifie si erreur 403/404
-        price = float(resp_price.json()['price'])
-        
-        # Ratio L/S (Uniquement dispo sur Binance Futures)
-        url_ls = "https://fapi.binance.com/fapi/v1/globalLongShortAccountRatio"
-        params_ls = {'symbol': 'BTCUSDT', 'period': '5m', 'limit': 1}
-        try:
-            ls_data = requests.get(url_ls, params=params_ls, headers=headers, timeout=2).json()
-            ratio = float(ls_data[0]['longShortRatio'])
-        except:
-            ratio = 0 # Si bloqué sur Futures
+        # Initialisation CCXT
+        if exchange_name == 'Kraken':
+            exch = ccxt.kraken()
+            pair = 'BTC/USD'
+        elif exchange_name == 'Coinbase':
+            exch = ccxt.coinbasepro()
+            pair = 'BTC-USD'
+        else:
+            return None
             
-        # Carnet d'ordres
-        url_depth = "https://api.binance.com/api/v3/depth"
-        params_depth = {'symbol': 'BTCUSDT', 'limit': 5000}
-        depth_data = requests.get(url_depth, params=params_depth, headers=headers, timeout=2).json()
-        
-        # Si on arrive ici, c'est que Binance fonctionne
-        return process_depth_data(depth_data, price, ratio, "Binance")
+        # Récupération carnet (500 ordres)
+        ob = exch.fetch_order_book(pair, limit=300)
+        return ob
+    except:
+        return None
 
-    except Exception as e:
-        # 2. FALLBACK KRAKEN (Priorité 2 - Compatible US Servers)
-        # Si Binance échoue, on utilise Kraken silencieusement
-        try:
-            # Prix Kraken (Pair XBTUSD)
-            url_k_price = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
-            resp_k = requests.get(url_k_price, headers=headers, timeout=2).json()
-            # Kraken API structure: result -> XXBTZUSD -> c -> [0]
-            price = float(resp_k['result']['XXBTZUSD']['c'][0])
-            
-            # Carnet Kraken
-            url_k_depth = "https://api.kraken.com/0/public/Depth?pair=XBTUSD&count=500"
-            depth_k = requests.get(url_k_depth, headers=headers, timeout=2).json()
-            # Mapping au format standard
-            raw_depth = {
-                'bids': depth_k['result']['XXBTZUSD']['bids'],
-                'asks': depth_k['result']['XXBTZUSD']['asks']
-            }
-            
-            return process_depth_data(raw_depth, price, 0, "Kraken (Relais)")
-            
-        except Exception as k_e:
-            st.error(f"Échec critique (Binance & Kraken bloqués): {k_e}")
-            return 0, 0, 0, 0, pd.DataFrame(), "Erreur"
+# --- 2. FETCHER HYPERLIQUID (DEX - API REST) ---
+def get_hyperliquid_depth():
+    try:
+        url = "https://api.hyperliquid.xyz/info"
+        headers = {'Content-Type': 'application/json'}
+        # Payload spécifique Hyperliquid
+        payload = {"type": "l2Book", "coin": "BTC"}
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=3)
+        data = response.json()
+        
+        # Formatage pour matcher CCXT (levels = [[price, qty], ...])
+        bids = [[float(level['px']), float(level['sz'])] for level in data['levels'][0]]
+        asks = [[float(level['px']), float(level['sz'])] for level in data['levels'][1]]
+        
+        return {'bids': bids, 'asks': asks}
+    except:
+        return None
 
-def process_depth_data(data, spot_price, ratio, source_name):
-    """Traite les données brutes (Binance ou Kraken) pour faire les murs"""
-    
+# --- MOTEUR D'AGRÉGATION ---
+def process_cloud_heatmap(spot_price):
     bucket_size = 50 
+    global_bids = {}
+    global_asks = {}
+    report = []
     
-    # Bids (Achats)
-    bids = {}
-    for entry in data['bids']:
-        p = float(entry[0])
-        q = float(entry[1])
-        if p < spot_price * 0.95: continue 
-        bucket = (p // bucket_size) * bucket_size
-        bids[bucket] = bids.get(bucket, 0) + q
+    # Liste des sources "Cloud Safe"
+    sources = ['Kraken', 'Coinbase', 'Hyperliquid']
+    
+    # Barre de progression
+    my_bar = st.progress(0, text="Connexion aux marchés...")
+    step = 1.0 / len(sources)
+    curr = 0.0
+    
+    for source in sources:
+        if source == 'Hyperliquid':
+            ob = get_hyperliquid_depth()
+        else:
+            ob = get_cex_depth(source)
+            
+        if ob:
+            report.append(f"✅ **{source}**")
+            
+            # Agregation Bids
+            for p, q in ob['bids']:
+                if p < spot_price * 0.94: continue # Filtre -6%
+                bucket = (p // bucket_size) * bucket_size
+                global_bids[bucket] = global_bids.get(bucket, 0) + q
+                
+            # Agregation Asks
+            for p, q in ob['asks']:
+                if p > spot_price * 1.06: continue # Filtre +6%
+                bucket = (p // bucket_size) * bucket_size
+                global_asks[bucket] = global_asks.get(bucket, 0) + q
+        else:
+            report.append(f"❌ **{source}**")
+            
+        curr += step
+        my_bar.progress(min(curr, 1.0))
         
-    # Asks (Ventes)
-    asks = {}
-    for entry in data['asks']:
-        p = float(entry[0])
-        q = float(entry[1])
-        if p > spot_price * 1.05: continue 
-        bucket = (p // bucket_size) * bucket_size
-        asks[bucket] = asks.get(bucket, 0) + q
-        
+    my_bar.empty()
+    
+    # Création DataFrame
+    df_bids = pd.DataFrame(list(global_bids.items()), columns=['Price', 'Volume'])
+    df_bids['Side'] = 'Support (Achat)'
+    df_bids['Volume'] = df_bids['Volume'] * -1
+    
+    df_asks = pd.DataFrame(list(global_asks.items()), columns=['Price', 'Volume'])
+    df_asks['Side'] = 'Résistance (Vente)'
+    
     # Max Walls
-    bid_wall = max(bids, key=bids.get) if bids else spot_price
-    ask_wall = max(asks, key=asks.get) if asks else spot_price
+    bid_wall = max(global_bids, key=global_bids.get) if global_bids else spot_price
+    ask_wall = max(global_asks, key=global_asks.get) if global_asks else spot_price
     
-    # DataFrame
-    df_bids = pd.DataFrame(list(bids.items()), columns=['Price', 'Volume'])
-    df_bids['Side'] = 'Achat (Support)'
-    df_bids['Volume'] = df_bids['Volume'] * -1 
-    
-    df_asks = pd.DataFrame(list(asks.items()), columns=['Price', 'Volume'])
-    df_asks['Side'] = 'Vente (Résistance)'
-    
-    df_final = pd.concat([df_bids, df_asks])
-    
-    return spot_price, ratio, bid_wall, ask_wall, df_final, source_name
+    return bid_wall, ask_wall, pd.concat([df_bids, df_asks]), report
 
 # --- INTERFACE ---
 
-st.title("📡 Market Radar")
-st.markdown("**Scanner Tactique :** Liquidité Spot & Sentiment.")
+st.title("☁️ Cloud Liquidity Heatmap")
+st.markdown("Agrégation de la liquidité **Institutionnelle** (Coinbase/Kraken) et **DeFi Pro** (Hyperliquid).")
+st.caption("ℹ️ Fonctionne sans VPN/Proxy sur Streamlit Cloud.")
 
-if st.button("🔄 SCANNERS LES MURS & SENTIMENT"):
-    
-    with st.spinner("Connexion aux flux de données..."):
-        spot, ls_ratio, bid_wall, ask_wall, df_walls, source = get_crypto_data()
+# Récup prix de référence (Kraken est safe)
+try:
+    ticker = ccxt.kraken().fetch_ticker('BTC/USD')
+    spot = ticker['last']
+    st.metric("Prix Référence (Kraken)", f"${spot:,.0f}")
+except:
+    spot = 0
+    st.error("Erreur de connexion Kraken Initiale")
+
+if st.button("LANCER LE SCAN CLOUD"):
+    if spot > 0:
+        bid_wall, ask_wall, df, report = process_cloud_heatmap(spot)
         
-        if spot > 0:
-            # Indicateur de Source (Pour savoir si on est sur Binance ou Kraken)
-            if "Kraken" in source:
-                st.warning(f"⚠️ Binance bloqué (IP Cloud). Données récupérées via **{source}**.")
-            else:
-                st.success(f"✅ Données en direct de **{source}**.")
-            
-            st.markdown(f"### 🎯 Prix Actuel: **${spot:,.0f}**")
-            
-            # Métriques
-            col1, col2, col3 = st.columns(3)
-            col1.metric("🛡️ Mur Achat", f"${bid_wall:,.0f}", delta=f"{((bid_wall-spot)/spot)*100:.2f}%", delta_color="normal")
-            col2.metric("⚔️ Mur Vente", f"${ask_wall:,.0f}", delta=f"{((ask_wall-spot)/spot)*100:.2f}%", delta_color="inverse")
-            
-            # Ratio (Si dispo)
-            if ls_ratio > 0:
-                state = "Trop Bullish" if ls_ratio > 2.0 else ("Trop Bearish" if ls_ratio < 0.7 else "Neutre")
-                col3.metric("⚖️ L/S Ratio", f"{ls_ratio:.2f}", state)
-            else:
-                col3.metric("⚖️ L/S Ratio", "N/A", "Non dispo sur Kraken")
-
-            st.divider()
-            
-            # Graphique
-            st.markdown("#### 📊 Carte de Chaleur (Liquidité Immédiate)")
-            chart = alt.Chart(df_walls).mark_bar().encode(
-                x=alt.X('Price', title='Prix ($)', scale=alt.Scale(zero=False)),
-                y=alt.Y('Volume', title='Volume (BTC)'),
-                color=alt.Color('Side', scale=alt.Scale(domain=['Achat (Support)', 'Vente (Résistance)'], range=['#00C853', '#D50000'])),
-                tooltip=['Price', 'Volume', 'Side']
-            ).interactive()
-            st.altair_chart(chart, use_container_width=True)
-            
-            # Code
-            st.success("✅ Code généré pour 'Bitget H1 Master'.")
-            code_snippet = f"""// --- DATA TACTIQUE ({source}) ---
-float binance_bid = {bid_wall}
-float binance_ask = {ask_wall}
-float ls_ratio = {ls_ratio if ls_ratio > 0 else 1.0}"""
-            st.code(code_snippet, language="pine")
-            
-        else:
-            st.error("Impossible de récupérer les données.")
+        # Affichage des sources
+        st.write("Sources connectées : " + " | ".join(report))
+        
+        col1, col2 = st.columns(2)
+        col1.metric("🛡️ SUPPORT MAJEUR", f"${bid_wall:,.0f}")
+        col2.metric("⚔️ RESISTANCE MAJEURE", f"${ask_wall:,.0f}")
+        
+        # Chart
+        c = alt.Chart(df).mark_bar().encode(
+            x=alt.X('Price', scale=alt.Scale(zero=False)),
+            y='Volume',
+            color=alt.Color('Side', scale=alt.Scale(range=['#00E676', '#FF1744'])),
+            tooltip=['Price', 'Volume', 'Side']
+        ).interactive()
+        st.altair_chart(c, use_container_width=True)
+        
+        # Code pour TradingView
+        st.success("Données prêtes.")
+        code = f"""// --- DATA CLOUD (Kraken/Coinbase/Hyperliquid) ---
+float cloud_bid_wall = {bid_wall}
+float cloud_ask_wall = {ask_wall}"""
+        st.code(code, language='pine')
