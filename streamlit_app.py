@@ -5,183 +5,126 @@ import pandas as pd
 import altair as alt
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Cloud Heatmap ☁️", page_icon="☁️", layout="centered")
+st.set_page_config(page_title="Deep Market Scan", layout="centered")
+st.markdown("""<style>.stApp {background-color: #0E1117;}</style>""", unsafe_allow_html=True)
 
-st.markdown("""
-<style>
-    .stApp {background-color: #0E1117;}
-    div.stButton > button {
-        width: 100%; background-color: #7C4DFF; color: white; border: none; height: 3em; font-weight: bold; border-radius: 8px;
-    }
-    div.stButton > button:hover {background-color: #651FFF;}
-</style>
-""", unsafe_allow_html=True)
-
-# --- 0. UTILITAIRES ---
-def get_usdt_exchange_rate():
-    """Récupère le taux USDT/USD pour la conversion"""
+# --- UTILITAIRES ---
+def get_usdt_rate():
     try:
-        # On utilise Kraken pour avoir la valeur réelle du Tether en Dollar
-        ticker = ccxt.kraken().fetch_ticker('USDT/USD')
-        return float(ticker['last'])
+        return float(ccxt.kraken().fetch_ticker('USDT/USD')['last'])
     except:
-        return 1.0 # Fallback si échec (1 USDT = 1 USD)
+        return 1.0
 
-# --- 1. FETCHERS CEX (Kraken & Coinbase) ---
-def get_cex_depth(exchange_name):
+# --- FETCHERS ---
+def get_depth(source):
     try:
-        if exchange_name == 'Kraken':
-            exch = ccxt.kraken()
-            pair = 'BTC/USD'
-        elif exchange_name == 'Coinbase':
-            exch = ccxt.coinbasepro()
-            pair = 'BTC-USD'
-        else:
-            return None
+        if source == 'Binance': # AJOUT MAJEUR
+            exch = ccxt.binance()
+            pair = 'BTC/USDT' # Binance est déjà en USDT
+            return exch.fetch_order_book(pair, limit=1000), 1.0 # Taux 1:1
             
-        # AUGMENTATION DE LA PROFONDEUR : limit=1000 au lieu de 300
-        ob = exch.fetch_order_book(pair, limit=1000)
-        return ob
+        elif source == 'Kraken':
+            exch = ccxt.kraken()
+            return exch.fetch_order_book('BTC/USD', limit=500), 'USD'
+            
+        elif source == 'Coinbase':
+            exch = ccxt.coinbasepro()
+            return exch.fetch_order_book('BTC-USD', limit=500), 'USD'
+            
+        elif source == 'Hyperliquid':
+            url = "https://api.hyperliquid.xyz/info"
+            payload = {"type": "l2Book", "coin": "BTC"}
+            res = requests.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=3).json()
+            bids = [[float(l['px']), float(l['sz'])] for l in res['levels'][0]]
+            asks = [[float(l['px']), float(l['sz'])] for l in res['levels'][1]]
+            return {'bids': bids, 'asks': asks}, 'USD'
     except:
-        return None
+        return None, None
 
-# --- 2. FETCHER HYPERLIQUID (DEX - API REST) ---
-def get_hyperliquid_depth():
-    try:
-        url = "https://api.hyperliquid.xyz/info"
-        headers = {'Content-Type': 'application/json'}
-        payload = {"type": "l2Book", "coin": "BTC"}
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
-        data = response.json()
-        
-        # Hyperliquid renvoie les données en USDC/USD, on traitera ça comme du USD
-        bids = [[float(level['px']), float(level['sz'])] for level in data['levels'][0]]
-        asks = [[float(level['px']), float(level['sz'])] for level in data['levels'][1]]
-        
-        return {'bids': bids, 'asks': asks}
-    except:
-        return None
-
-# --- MOTEUR D'AGRÉGATION ---
-def process_cloud_heatmap(spot_price_usd):
-    # Récupération du taux de conversion USDT
-    usdt_rate = get_usdt_exchange_rate()
-    
-    # Calcul du prix Spot en USDT pour centrer le graph
-    spot_price_usdt = spot_price_usd / usdt_rate
-    
-    # Augmentation de la taille des "seaux" (buckets) car on regarde plus large
-    bucket_size = 100 
+# --- CORE LOGIC ---
+def scan_market(bucket_size=20): # Granularité affinée (20$ au lieu de 100$)
+    usdt_rate = get_usdt_rate()
+    sources = ['Binance', 'Kraken', 'Coinbase', 'Hyperliquid']
     
     global_bids = {}
     global_asks = {}
     report = []
     
-    sources = ['Kraken', 'Coinbase', 'Hyperliquid']
+    # Prix de référence (Binance pour la précision)
+    try:
+        ref_price = float(ccxt.binance().fetch_ticker('BTC/USDT')['last'])
+    except:
+        ref_price = 88000
     
-    my_bar = st.progress(0, text=f"Scan du marché (Taux USDT: ${usdt_rate:.4f})...")
-    step = 1.0 / len(sources)
-    curr = 0.0
+    my_bar = st.progress(0, text="Deep Scan en cours...")
     
-    for source in sources:
-        if source == 'Hyperliquid':
-            ob = get_hyperliquid_depth()
-        else:
-            ob = get_cex_depth(source)
-            
+    for i, source in enumerate(sources):
+        ob, currency = get_depth(source)
         if ob:
-            report.append(f"✅ **{source}**")
+            report.append(f"✅ {source}")
+            # Facteur de conversion
+            rate = 1.0 if currency == 1.0 else (1.0 / usdt_rate)
             
-            # --- TRAITEMENT BIDS ---
-            for entry in ob['bids']:
-                p_usd = float(entry[0])
-                q = float(entry[1])
-                
-                # CONVERSION EN USDT
-                p_usdt = p_usd / usdt_rate
-                
-                # FILTRE ÉLARGI : On prend tout ce qui est à +/- 15% (au lieu de 6%)
-                if p_usdt < spot_price_usdt * 0.85: continue 
-                
-                bucket = (p_usdt // bucket_size) * bucket_size
-                global_bids[bucket] = global_bids.get(bucket, 0) + q
-                
-            # --- TRAITEMENT ASKS ---
-            for entry in ob['asks']:
-                p_usd = float(entry[0])
-                q = float(entry[1])
-                
-                # CONVERSION EN USDT
-                p_usdt = p_usd / usdt_rate
-                
-                if p_usdt > spot_price_usdt * 1.15: continue 
-                
-                bucket = (p_usdt // bucket_size) * bucket_size
-                global_asks[bucket] = global_asks.get(bucket, 0) + q
+            # --- AGREGATION ---
+            # On scanne +/- 5% autour du prix (plus serré mais plus précis)
+            min_price = ref_price * 0.98
+            max_price = ref_price * 1.02
+            
+            for side, data in [('bids', ob['bids']), ('asks', ob['asks'])]:
+                for price, qty in data:
+                    p_usdt = float(price) * rate
+                    
+                    if min_price < p_usdt < max_price:
+                        # Arrondi au bucket près
+                        bucket = round(p_usdt / bucket_size) * bucket_size
+                        
+                        if side == 'bids':
+                            global_bids[bucket] = global_bids.get(bucket, 0) + qty
+                        else:
+                            global_asks[bucket] = global_asks.get(bucket, 0) + qty
         else:
-            report.append(f"❌ **{source}**")
-            
-        curr += step
-        my_bar.progress(min(curr, 1.0))
+            report.append(f"❌ {source}")
+        my_bar.progress((i + 1) / len(sources))
         
     my_bar.empty()
     
-    if not global_bids and not global_asks:
-        return spot_price_usdt, spot_price_usdt, pd.DataFrame(), report, usdt_rate
-
-    # Création DataFrame
-    df_bids = pd.DataFrame(list(global_bids.items()), columns=['Price', 'Volume'])
-    df_bids['Side'] = 'Support (Achat)'
-    df_bids['Volume'] = df_bids['Volume'] * -1 # Négatif pour le graph
+    # DataFrame construction
+    data = []
+    for p, v in global_bids.items():
+        data.append({'Price': p, 'Volume': -v, 'Side': 'Support'})
+    for p, v in global_asks.items():
+        data.append({'Price': p, 'Volume': v, 'Side': 'Resistance'})
+        
+    df = pd.DataFrame(data)
     
-    df_asks = pd.DataFrame(list(global_asks.items()), columns=['Price', 'Volume'])
-    df_asks['Side'] = 'Résistance (Vente)'
+    # Calcul des murs les plus proches
+    bid_wall = max(global_bids, key=global_bids.get) if global_bids else ref_price
+    ask_wall = max(global_asks, key=global_asks.get) if global_asks else ref_price
     
-    # Identification des murs majeurs
-    bid_wall = max(global_bids, key=global_bids.get) if global_bids else spot_price_usdt
-    ask_wall = max(global_asks, key=global_asks.get) if global_asks else spot_price_usdt
+    return df, report, bid_wall, ask_wall, ref_price
+
+# --- UI ---
+st.title("🦅 Eagle Eye Heatmap")
+st.caption("Binance + Kraken + Coinbase + Hyperliquid | Granularité: 20$")
+
+if st.button("SCAN DEEP LIQUIDITY"):
+    df, sources, bid_wall, ask_wall, spot = scan_market(bucket_size=20)
     
-    return bid_wall, ask_wall, pd.concat([df_bids, df_asks]), report, usdt_rate
+    st.write(" | ".join(sources))
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Prix Actuel", f"{spot:,.0f}")
+    col2.metric("Gros Support", f"{bid_wall:,.0f}", delta=f"{bid_wall-spot:.0f}")
+    col3.metric("Grosse Résistance", f"{ask_wall:,.0f}", delta=f"{ask_wall-spot:.0f}")
 
-# --- INTERFACE ---
-
-st.title("☁️ Cloud Liquidity Heatmap (USDT)")
-st.markdown("Agrégation de la liquidité convertie en **USDT** pour le trading Perp.")
-st.caption("ℹ️ Données élargies (+/- 15%) et converties selon le taux USDT/USD réel.")
-
-# Init Prix
-try:
-    ticker = ccxt.kraken().fetch_ticker('BTC/USD')
-    spot_usd = ticker['last']
-    st.metric("Prix Référence (USD - Kraken)", f"${spot_usd:,.0f}")
-except:
-    spot_usd = 0
-    st.error("Erreur de connexion Kraken Initiale")
-
-if st.button("LANCER LE SCAN CLOUD"):
-    if spot_usd > 0:
-        bid_wall, ask_wall, df, report, rate_used = process_cloud_heatmap(spot_usd)
-        
-        st.write(f"Sources : {' | '.join(report)} (Taux USDT: {rate_used:.4f})")
-        
-        col1, col2 = st.columns(2)
-        col1.metric("🛡️ SUPPORT (USDT)", f"{bid_wall:,.0f}")
-        col2.metric("⚔️ RESISTANCE (USDT)", f"{ask_wall:,.0f}")
-        
-        # Chart Altair
-        c = alt.Chart(df).mark_bar().encode(
-            x=alt.X('Price', scale=alt.Scale(zero=False), title='Prix (USDT)'),
-            y='Volume',
-            color=alt.Color('Side', scale=alt.Scale(range=['#00E676', '#FF1744'])),
-            tooltip=['Price', 'Volume', 'Side']
-        ).interactive()
-        
-        # CORRECTION DU WARNING : width="stretch"
-        st.altair_chart(c, width="stretch")
-        
-        st.success("Données calibrées pour Bitget BTC/USDT.")
-        code = f"""// --- DATA CLOUD (USDT Calibrated) ---
-float cloud_bid_wall = {bid_wall:.2f}
-float cloud_ask_wall = {ask_wall:.2f}"""
-        st.code(code, language='pine')
+    # Chart amélioré
+    base = alt.Chart(df).encode(x=alt.X('Price', scale=alt.Scale(domain=[spot*0.99, spot*1.01]))) # Zoom auto
+    
+    bars = base.mark_bar(size=15).encode( # Barres plus fines
+        y='Volume',
+        color=alt.Color('Side', scale=alt.Scale(range=['#00C853', '#D50000'])),
+        tooltip=['Price', 'Volume']
+    )
+    
+    st.altair_chart(bars, width="stretch")
+    st.success(f"Spread Analyse: La liquidité est concentrée entre {bid_wall} et {ask_wall}.")
