@@ -25,11 +25,11 @@ def get_usdt_rate():
         return 1.0
 
 # --- FETCHERS (RECUPERATION DES DONNEES) ---
+# --- FETCHERS (RECUPERATION DES DONNEES CORRIGÉE) ---
 def fetch_depth(source):
     try:
         # --- 1. BITGET (AVEC AUTHENTIFICATION) ---
         if source == 'Bitget':
-            # Vérification si les secrets existent
             if "bitget" in st.secrets:
                 config = {
                     'apiKey': st.secrets["bitget"]["api_key"],
@@ -38,18 +38,16 @@ def fetch_depth(source):
                     'enableRateLimit': True
                 }
                 exch = ccxt.bitget(config)
-                log(source, "Mode Authentifié activé", "INFO")
             else:
-                # Fallback public si pas de secrets configurés
                 exch = ccxt.bitget({'enableRateLimit': True})
-                log(source, "Mode Public (Pas de secrets détectés)", "WARNING")
             
             return exch.fetch_order_book('BTC/USDT', limit=200), 1.0
 
-        # --- 2. KUCOIN ---
+        # --- 2. KUCOIN (CORRECTION LIMIT) ---
         elif source == 'KuCoin':
             exch = ccxt.kucoin({'enableRateLimit': True})
-            return exch.fetch_order_book('BTC/USDT', limit=200), 1.0
+            # KuCoin impose limit=20 ou limit=100 strictement
+            return exch.fetch_order_book('BTC/USDT', limit=100), 1.0
 
         # --- 3. GATE.IO ---
         elif source == 'Gate.io':
@@ -91,9 +89,8 @@ def fetch_depth(source):
     
     return None, None
 
-# --- MOTEUR D'AGREGATION ---
+# --- MOTEUR D'AGREGATION (CORRIGÉ V8) ---
 def scan_max_sources(bucket_size=20): 
-    # Reset des logs globaux
     global debug_logs
     debug_logs = []
     
@@ -107,7 +104,6 @@ def scan_max_sources(bucket_size=20):
     report = []
     prices_collected = []
     
-    # Barre de progression
     my_bar = st.progress(0, text="Initialisation du scan...")
     
     for i, source in enumerate(sources):
@@ -119,19 +115,16 @@ def scan_max_sources(bucket_size=20):
             report.append(f"✅ {source}")
             log(source, "Données récupérées", "SUCCESS")
             
-            # Calcul du taux de conversion pour cette source
             rate = 1.0 if currency == 1.0 else (1.0 / usdt_rate)
             
-            # Récupération du prix Mid-Market pour le centrage
             try:
                 best_bid = float(ob['bids'][0][0])
                 best_ask = float(ob['asks'][0][0])
                 mid_price = ((best_bid + best_ask) / 2) * rate
                 prices_collected.append(mid_price)
-            except:
-                pass
+            except: pass
             
-            # Agrégation des Bids
+            # Agrégation
             for entry in ob['bids']:
                 try:
                     p_usdt = float(entry[0]) * rate
@@ -140,7 +133,6 @@ def scan_max_sources(bucket_size=20):
                     global_bids[bucket] = global_bids.get(bucket, 0) + q
                 except: continue
             
-            # Agrégation des Asks
             for entry in ob['asks']:
                 try:
                     p_usdt = float(entry[0]) * rate
@@ -150,50 +142,55 @@ def scan_max_sources(bucket_size=20):
                 except: continue
         else:
             report.append(f"❌ {source}")
-            # Si pas de log d'erreur spécifique avant, on en met un générique
             if not any(source in l and "ERROR" in l for l in debug_logs):
-                log(source, "Aucune donnée renvoyée (Orderbook vide ou inaccessible)", "ERROR")
+                log(source, "Aucune donnée renvoyée", "ERROR")
         
     my_bar.empty()
     
-    # Calcul du prix de référence (Moyenne des sources valides)
-    if prices_collected:
-        ref_price = statistics.mean(prices_collected)
-    else:
-        ref_price = 88000.0 # Fallback si tout échoue
+    # Prix Référence
+    ref_price = statistics.mean(prices_collected) if prices_collected else 88000.0
     
-    # Filtrage et création du DataFrame (+/- 1.5% autour du prix)
+    # Scan Range (+/- 1.5%)
     scan_range = ref_price * 0.015 
     min_p, max_p = ref_price - scan_range, ref_price + scan_range
     
     data = []
-    # On filtre le bruit (volumes < 0.02 BTC)
     for p, v in global_bids.items():
         if min_p < p < max_p and v > 0.02: 
             data.append({'Price': p, 'Volume': -v, 'Side': 'Support'})
-            
     for p, v in global_asks.items():
         if min_p < p < max_p and v > 0.02:
             data.append({'Price': p, 'Volume': v, 'Side': 'Resistance'})
             
     df = pd.DataFrame(data)
     
-    # Détection des murs (Plus gros volume visible)
+    # --- CORRECTION ICI : LOGIQUE DES MURS ---
     bid_wall, ask_wall = ref_price, ref_price
+    
+    # Buffer de bruit : On ignore les volumes à +/- 50$ du prix actuel
+    # Cela force le code à chercher le "vrai" prochain mur
+    noise_buffer = 50 
     
     if not df.empty:
         try:
-            # On cherche le min volume (car négatif) pour le support
-            df_bids = df[df['Side']=='Support']
+            # SUPPORT : On cherche le max volume UNIQUEMENT en dessous de (Prix - Buffer)
+            df_bids = df[(df['Side']=='Support') & (df['Price'] < (ref_price - noise_buffer))]
             if not df_bids.empty:
+                # On prend le prix avec le plus gros volume (min car négatif)
                 bid_wall = df_bids.loc[df_bids['Volume'].idxmin()]['Price']
-                
-            # On cherche le max volume pour la résistance
-            df_asks = df[df['Side']=='Resistance']
+            else:
+                # Fallback si pas de mur loin : on prend le plus proche
+                bid_wall = df[df['Side']=='Support']['Price'].min()
+
+            # RESISTANCE : On cherche le max volume UNIQUEMENT au dessus de (Prix + Buffer)
+            df_asks = df[(df['Side']=='Resistance') & (df['Price'] > (ref_price + noise_buffer))]
             if not df_asks.empty:
                 ask_wall = df_asks.loc[df_asks['Volume'].idxmax()]['Price']
-        except: 
-            pass
+            else:
+                 ask_wall = df[df['Side']=='Resistance']['Price'].max()
+                 
+        except Exception as e: 
+            log("Algorithm", f"Erreur calcul mur: {e}", "WARNING")
 
     return df, report, bid_wall, ask_wall, ref_price
 
