@@ -25,7 +25,6 @@ def get_usdt_rate():
         return 1.0
 
 # --- FETCHERS (RECUPERATION DES DONNEES) ---
-# --- FETCHERS (RECUPERATION DES DONNEES CORRIGÉE) ---
 def fetch_depth(source):
     try:
         # --- 1. BITGET (AVEC AUTHENTIFICATION) ---
@@ -89,13 +88,14 @@ def fetch_depth(source):
     
     return None, None
 
-# --- MOTEUR D'AGREGATION (CORRIGÉ V8) ---
+# --- MOTEUR D'AGREGATION (V9 - Buffer 300$) ---
 def scan_max_sources(bucket_size=20): 
     global debug_logs
     debug_logs = []
     
+    # Récupération du taux pour conversion USD -> USDT
     usdt_rate = get_usdt_rate()
-    log("System", f"Taux conversion USDT/USD: {usdt_rate:.4f}", "INFO")
+    log("System", f"Taux conversion (1 USD = {1/usdt_rate:.4f} USDT)", "INFO")
     
     sources = ['Bitget', 'KuCoin', 'Gate.io', 'MEXC', 'OKX', 'Kraken', 'Coinbase', 'Hyperliquid']
     
@@ -104,30 +104,29 @@ def scan_max_sources(bucket_size=20):
     report = []
     prices_collected = []
     
-    my_bar = st.progress(0, text="Initialisation du scan...")
+    my_bar = st.progress(0, text="Scan global en cours...")
     
     for i, source in enumerate(sources):
-        my_bar.progress((i / len(sources)), text=f"Connexion à {source}...")
+        my_bar.progress((i / len(sources)), text=f"Analyse {source}...")
         
         ob, currency = fetch_depth(source)
         
         if ob and 'bids' in ob and len(ob['bids']) > 0:
             report.append(f"✅ {source}")
-            log(source, "Données récupérées", "SUCCESS")
             
+            # Facteur de conversion (1.0 si déjà USDT, sinon calculé)
             rate = 1.0 if currency == 1.0 else (1.0 / usdt_rate)
             
             try:
-                best_bid = float(ob['bids'][0][0])
-                best_ask = float(ob['asks'][0][0])
-                mid_price = ((best_bid + best_ask) / 2) * rate
-                prices_collected.append(mid_price)
+                # On convertit le prix mid-market en USDT pour la moyenne
+                mid = ((float(ob['bids'][0][0]) + float(ob['asks'][0][0])) / 2) * rate
+                prices_collected.append(mid)
             except: pass
             
-            # Agrégation
+            # --- AGRÉGATION NORMALISÉE EN USDT ---
             for entry in ob['bids']:
                 try:
-                    p_usdt = float(entry[0]) * rate
+                    p_usdt = float(entry[0]) * rate # Conversion
                     q = float(entry[1])
                     bucket = round(p_usdt / bucket_size) * bucket_size
                     global_bids[bucket] = global_bids.get(bucket, 0) + q
@@ -135,54 +134,53 @@ def scan_max_sources(bucket_size=20):
             
             for entry in ob['asks']:
                 try:
-                    p_usdt = float(entry[0]) * rate
+                    p_usdt = float(entry[0]) * rate # Conversion
                     q = float(entry[1])
                     bucket = round(p_usdt / bucket_size) * bucket_size
                     global_asks[bucket] = global_asks.get(bucket, 0) + q
                 except: continue
         else:
             report.append(f"❌ {source}")
-            if not any(source in l and "ERROR" in l for l in debug_logs):
-                log(source, "Aucune donnée renvoyée", "ERROR")
         
     my_bar.empty()
     
-    # Prix Référence
+    # Prix de Référence (Moyenne de tous les échanges en USDT)
     ref_price = statistics.mean(prices_collected) if prices_collected else 88000.0
     
-    # Scan Range (+/- 1.5%)
-    scan_range = ref_price * 0.015 
+    # On regarde large (+/- 2000$) pour le graphique
+    scan_range = 2000 
     min_p, max_p = ref_price - scan_range, ref_price + scan_range
     
     data = []
+    # Filtre graphique : on enlève les toutes petites barres (< 0.05 BTC) pour la lisibilité
     for p, v in global_bids.items():
-        if min_p < p < max_p and v > 0.02: 
+        if min_p < p < max_p and v > 0.05: 
             data.append({'Price': p, 'Volume': -v, 'Side': 'Support'})
     for p, v in global_asks.items():
-        if min_p < p < max_p and v > 0.02:
+        if min_p < p < max_p and v > 0.05:
             data.append({'Price': p, 'Volume': v, 'Side': 'Resistance'})
             
     df = pd.DataFrame(data)
     
-    # --- CORRECTION ICI : LOGIQUE DES MURS ---
+    # --- LOGIQUE INTELLIGENTE DES MURS ---
     bid_wall, ask_wall = ref_price, ref_price
     
-    # Buffer de bruit : On ignore les volumes à +/- 50$ du prix actuel
-    # Cela force le code à chercher le "vrai" prochain mur
-    noise_buffer = 50 
+    # BUFFER AUGMENTÉ : 500$
+    # On ignore tout ce qui est à moins de 300$ du prix actuel (Zone de Scalping)
+    # Pour trouver les vrais murs de "Swing"
+    noise_buffer = 500 
     
     if not df.empty:
         try:
-            # SUPPORT : On cherche le max volume UNIQUEMENT en dessous de (Prix - Buffer)
+            # Recherche du plus gros volume SOUS (Prix - 300$)
             df_bids = df[(df['Side']=='Support') & (df['Price'] < (ref_price - noise_buffer))]
             if not df_bids.empty:
-                # On prend le prix avec le plus gros volume (min car négatif)
                 bid_wall = df_bids.loc[df_bids['Volume'].idxmin()]['Price']
             else:
-                # Fallback si pas de mur loin : on prend le plus proche
+                # Fallback : Si pas de mur loin, on prend le max local
                 bid_wall = df[df['Side']=='Support']['Price'].min()
 
-            # RESISTANCE : On cherche le max volume UNIQUEMENT au dessus de (Prix + Buffer)
+            # Recherche du plus gros volume AU-DESSUS de (Prix + 300$)
             df_asks = df[(df['Side']=='Resistance') & (df['Price'] > (ref_price + noise_buffer))]
             if not df_asks.empty:
                 ask_wall = df_asks.loc[df_asks['Volume'].idxmax()]['Price']
@@ -190,7 +188,7 @@ def scan_max_sources(bucket_size=20):
                  ask_wall = df[df['Side']=='Resistance']['Price'].max()
                  
         except Exception as e: 
-            log("Algorithm", f"Erreur calcul mur: {e}", "WARNING")
+            log("System", f"Erreur murs: {e}", "WARNING")
 
     return df, report, bid_wall, ask_wall, ref_price
 
