@@ -148,7 +148,7 @@ def scan_max_sources(bucket_size=20):
     ref_price = statistics.mean(prices_collected) if prices_collected else 88000.0
     
     # On regarde large (+/- 2000$) pour le graphique
-    scan_range = 2000 
+    scan_range = 10000 
     min_p, max_p = ref_price - scan_range, ref_price + scan_range
     
     data = []
@@ -165,10 +165,10 @@ def scan_max_sources(bucket_size=20):
     # --- LOGIQUE INTELLIGENTE DES MURS ---
     bid_wall, ask_wall = ref_price, ref_price
     
-    # BUFFER AUGMENTÉ : 500$
+    # BUFFER AUGMENTÉ : 400$
     # On ignore tout ce qui est à moins de 300$ du prix actuel (Zone de Scalping)
     # Pour trouver les vrais murs de "Swing"
-    noise_buffer = 500 
+    noise_buffer = 400 
     
     if not df.empty:
         try:
